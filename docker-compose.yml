@@ -1,0 +1,16 @@
+services:
+  wa-sticker-bot:
+    build: .
+    container_name: wa-sticker-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist WhatsApp session (QR auth) across restarts
+      - ./auth_info_baileys:/app/auth_info_baileys
+    # Logs remain in the container stdout — Coolify streams them automatically
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
