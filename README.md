@@ -1,4 +1,4 @@
-# 🤩 WhatsApp Sticker Bot (Chroma)
+# WhatsApp Sticker Bot
 
 A WhatsApp bot that converts **images and videos** into **stickers** automatically when you send `.s`.
 
@@ -13,8 +13,6 @@ Built with [Baileys](https://github.com/WhiskeySockets/Baileys), [sharp](https:/
 | Send an image as sticker | Send image with caption `.s` |
 | Send a video as animated sticker | Send video with caption `.s` |
 | Convert someone else's image | Reply to the image with `.s` |
-
-Sticker pack: **made by** · Author: **Chroma**
 
 ---
 
