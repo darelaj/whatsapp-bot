@@ -3,11 +3,11 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Install native build tools for sharp
-RUN apk add --no-cache python3 make g++ ffmpeg
+# Install native build tools for sharp + git (required by some npm deps)
+RUN apk add --no-cache python3 make g++ ffmpeg git
 
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 COPY . .
 
