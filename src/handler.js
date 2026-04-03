@@ -123,7 +123,7 @@ async function handleMessage(sock, msg) {
         } else if (quotedType === 'videoMessage') {
           mediaMsg = buildDownloadMsg(msg, quotedInner, ctxInfo, 'videoMessage');
           mediaType = 'video';
-          isGif = !!quotedInner.videoMessage.gifPlayback;
+          isGif = !!quotedInner.videoMessage.gifPlayback || (quotedInner.videoMessage.mimetype || '').includes('gif');
         } else if (quotedType === 'stickerMessage') {
           await reply(sock, msg, '⚠️ That\'s already a sticker! Send an image or video.');
           return;
@@ -171,12 +171,14 @@ async function handleMessage(sock, msg) {
 
     // ── Convert ───────────────────────────────────────────────────────────────
     let stickerBuffer;
+    let animated = false;
     try {
       if (mediaType === 'image') {
         stickerBuffer = await imageToSticker(buffer);
       } else {
         const mime = isGif ? 'image/gif' : (mediaMsg.message?.videoMessage?.mimetype || 'video/mp4');
         stickerBuffer = await videoToSticker(buffer, mime);
+        animated = true;  // video/GIF always produces animated WebP
       }
     } catch (convertErr) {
       console.error('Conversion failed:', convertErr.message);
@@ -186,7 +188,11 @@ async function handleMessage(sock, msg) {
     }
 
     // ── Send sticker ──────────────────────────────────────────────────────────
-    await sock.sendMessage(from, { sticker: stickerBuffer }, { quoted: msg });
+    await sock.sendMessage(
+      from,
+      { sticker: stickerBuffer, ...(animated ? { isAnimated: true } : {}) },
+      { quoted: msg }
+    );
     await react(sock, msg, '✅');
 
     try {
