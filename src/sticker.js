@@ -3,7 +3,6 @@
 const { Sticker, StickerTypes } = require('wa-sticker-formatter');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-const { PassThrough } = require('stream');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
@@ -15,21 +14,34 @@ const PACK_NAME   = process.env.STICKER_PACK_NAME || 'made by';
 const AUTHOR_NAME = process.env.STICKER_AUTHOR    || 'Chroma';
 
 /**
- * Maximum animated sticker duration in seconds.
- * WhatsApp's official WebP spec allows up to 10 s, but the in-app sticker
- * creator trims to 6 s — so we match that to stay on the safe side.
+ * WhatsApp animated sticker constraints:
+ * - Format:     WebP
+ * - Dimensions: 512×512 px
+ * - File size:  ≤ 500 KB (animated), ≤ 100 KB (static)
+ * - Duration:   ≤ 6 s (safe limit; official max is 10 s)
+ * - Min frame duration: 8 ms
+ * - No audio
  */
-const MAX_DURATION_SECS = 6;
+const MAX_DURATION_SECS     = 6;
+const MAX_ANIMATED_SIZE_KB  = 500;
+const STICKER_DIMENSION     = 512;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
+function tmpFile(ext) {
+  const id = crypto.randomBytes(8).toString('hex');
+  return path.join(os.tmpdir(), `sticker_${id}${ext}`);
+}
+
+function safeUnlink(filePath) {
+  try { fs.unlinkSync(filePath); } catch (_) {}
+}
+
 /**
  * Probe the duration (in seconds) of a media buffer using ffprobe.
  * Returns 0 if the duration cannot be determined.
- * @param {string} inputPath  Path to the temp file
- * @returns {Promise<number>}
  */
 function probeDuration(inputPath) {
   return new Promise((resolve) => {
@@ -40,74 +52,8 @@ function probeDuration(inputPath) {
   });
 }
 
-/**
- * Trim a media buffer to `maxSecs` seconds using ffmpeg.
- * Returns the original buffer unchanged if within the limit.
- * @param {Buffer} buffer
- * @param {string} inputExt   e.g. '.mp4' | '.gif' | '.webm'
- * @param {string} outputExt  e.g. '.mp4' | '.gif'
- * @param {number} [maxSecs]
- * @returns {Promise<Buffer>}
- */
-function trimBuffer(buffer, inputExt, outputExt, maxSecs = MAX_DURATION_SECS) {
-  return new Promise((resolve, reject) => {
-    const id      = crypto.randomBytes(8).toString('hex');
-    const tmpDir  = os.tmpdir();
-    const inFile  = path.join(tmpDir, `sticker_in_${id}${inputExt}`);
-    const outFile = path.join(tmpDir, `sticker_out_${id}${outputExt}`);
-
-    fs.writeFileSync(inFile, buffer);
-
-    probeDuration(inFile).then((duration) => {
-      if (duration > 0 && duration <= maxSecs) {
-        // Already within limit — no trimming needed
-        fs.unlinkSync(inFile);
-        return resolve(buffer);
-      }
-
-      const cmd = ffmpeg(inFile)
-        .setDuration(maxSecs)
-        .outputOptions('-an')          // drop audio — stickers are muted
-        .output(outFile);
-
-      // For GIF output keep the palette-based encoding
-      if (outputExt === '.gif') {
-        cmd.outputOptions(['-vf', 'fps=15,scale=512:512:force_original_aspect_ratio=decrease']);
-      } else {
-        // MP4: re-encode quickly
-        cmd.videoCodec('libx264').outputOptions(['-preset', 'ultrafast', '-crf', '28']);
-      }
-
-      cmd
-        .on('error', (err) => {
-          safeUnlink(inFile);
-          safeUnlink(outFile);
-          reject(new Error(`ffmpeg trim error: ${err.message}`));
-        })
-        .on('end', () => {
-          let out;
-          try {
-            out = fs.readFileSync(outFile);
-          } catch (e) {
-            safeUnlink(inFile);
-            safeUnlink(outFile);
-            return reject(new Error('Failed to read trimmed output'));
-          }
-          safeUnlink(inFile);
-          safeUnlink(outFile);
-          resolve(out);
-        })
-        .run();
-    });
-  });
-}
-
-function safeUnlink(filePath) {
-  try { fs.unlinkSync(filePath); } catch (_) {}
-}
-
 // ────────────────────────────────────────────────────────────────────────────
-// Image → Static WebP sticker
+// Image → Static WebP sticker (via wa-sticker-formatter — works fine)
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
@@ -126,31 +72,137 @@ async function imageToSticker(buffer) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Video / GIF → Animated WebP sticker (with auto-trim)
+// Video / GIF → Animated WebP sticker (direct ffmpeg, bypassing the broken
+// wa-sticker-formatter video pipeline)
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * Convert a video or GIF buffer to an animated WhatsApp sticker.
- * Automatically trims to MAX_DURATION_SECS if the media is too long.
- * @param {Buffer} buffer
+ * Use ffmpeg to convert a video/GIF buffer directly to an animated WebP
+ * that meets ALL WhatsApp sticker constraints.
+ *
+ * Strategy:
+ *   1. Write input to temp file
+ *   2. Probe duration — clamp to MAX_DURATION_SECS
+ *   3. Encode to animated WebP at 512×512, ≤ 500 KB
+ *      - Start at quality 60, fps 15
+ *      - If output > 500 KB, retry with lower quality / fps
+ *   4. Inject sticker pack metadata via wa-sticker-formatter's Exif helper
+ *
+ * @param {Buffer} buffer    Raw media bytes
  * @param {string} mimetype  e.g. 'video/mp4' | 'image/gif' | 'video/webm'
  * @returns {Promise<Buffer>}
  */
 async function videoToSticker(buffer, mimetype) {
-  const isGif = mimetype === 'image/gif';
-  const inputExt  = isGif ? '.gif' : '.mp4';
-  const outputExt = isGif ? '.gif' : '.mp4';
+  const isGif   = mimetype === 'image/gif';
+  const inExt   = isGif ? '.gif' : '.mp4';
+  const inFile  = tmpFile(inExt);
+  const outFile = tmpFile('.webp');
 
-  // Trim to limit before converting — if already short enough this is a no-op
-  const trimmed = await trimBuffer(buffer, inputExt, outputExt);
+  fs.writeFileSync(inFile, buffer);
 
-  return new Sticker(trimmed, {
-    pack      : PACK_NAME,
-    author    : AUTHOR_NAME,
-    type      : StickerTypes.FULL,
-    categories: ['🎨'],
-    quality   : 80,
-  }).toBuffer();
+  try {
+    const duration = await probeDuration(inFile);
+
+    // Try progressively lower quality/fps until ≤ 500 KB
+    const attempts = [
+      { quality: 60, fps: 15 },
+      { quality: 45, fps: 12 },
+      { quality: 30, fps: 10 },
+      { quality: 20, fps: 8  },
+      { quality: 10, fps: 6  },
+    ];
+
+    let webpBuffer = null;
+
+    for (const { quality, fps } of attempts) {
+      await encodeAnimatedWebP(inFile, outFile, {
+        maxDuration : (duration > MAX_DURATION_SECS || duration === 0) ? MAX_DURATION_SECS : 0,
+        fps,
+        quality,
+        dimension   : STICKER_DIMENSION,
+      });
+
+      webpBuffer = fs.readFileSync(outFile);
+      const sizeKB = webpBuffer.length / 1024;
+
+      console.log(`[sticker] Animated WebP: ${sizeKB.toFixed(1)} KB (q=${quality}, fps=${fps})`);
+
+      if (sizeKB <= MAX_ANIMATED_SIZE_KB) {
+        break;  // 🎉 within limit
+      }
+
+      // Will retry with lower settings
+      safeUnlink(outFile);
+      webpBuffer = null;
+    }
+
+    if (!webpBuffer) {
+      // If all attempts failed to get under 500 KB, use the last attempt anyway
+      // (better than nothing — WhatsApp may still accept slightly larger stickers)
+      webpBuffer = fs.existsSync(outFile) ? fs.readFileSync(outFile) : null;
+      if (!webpBuffer) {
+        throw new Error('All encoding attempts failed');
+      }
+    }
+
+    // Inject sticker pack metadata using wa-sticker-formatter's Exif writer
+    const Exif = require('wa-sticker-formatter/dist/internal/Metadata/Exif').default;
+    const exif = new Exif({
+      pack      : PACK_NAME,
+      author    : AUTHOR_NAME,
+      categories: ['🎨'],
+    });
+    const finalBuffer = exif.add(webpBuffer);
+
+    return finalBuffer;
+  } finally {
+    safeUnlink(inFile);
+    safeUnlink(outFile);
+  }
+}
+
+/**
+ * Encode a media file to animated WebP using ffmpeg directly.
+ *
+ * @param {string} input   Input file path
+ * @param {string} output  Output file path (.webp)
+ * @param {object} opts
+ * @param {number} opts.maxDuration  Trim to this many seconds (0 = no trim)
+ * @param {number} opts.fps          Target frame rate
+ * @param {number} opts.quality      WebP quality 0-100
+ * @param {number} opts.dimension    Target width & height (512)
+ * @returns {Promise<void>}
+ */
+function encodeAnimatedWebP(input, output, { maxDuration, fps, quality, dimension }) {
+  return new Promise((resolve, reject) => {
+    const vf = [
+      `fps=${fps}`,
+      `scale=${dimension}:${dimension}:force_original_aspect_ratio=decrease`,
+      `pad=${dimension}:${dimension}:(ow-iw)/2:(oh-ih)/2:color=0x00000000`,  // transparent padding
+    ].join(',');
+
+    const cmd = ffmpeg(input);
+
+    if (maxDuration > 0) {
+      cmd.setDuration(maxDuration);
+    }
+
+    cmd
+      .outputOptions([
+        '-vf', vf,
+        '-vcodec', 'libwebp',
+        '-lossless', '0',
+        '-compression_level', '6',
+        '-q:v', String(quality),
+        '-loop', '0',          // loop forever
+        '-an',                 // no audio
+        '-vsync', '0',
+      ])
+      .output(output)
+      .on('error', (err) => reject(new Error(`ffmpeg encode error: ${err.message}`)))
+      .on('end', () => resolve())
+      .run();
+  });
 }
 
 module.exports = { imageToSticker, videoToSticker };

@@ -112,6 +112,7 @@ async function handleMessage(sock, msg) {
         const quotedInner =
           quoted?.ephemeralMessage?.message ||
           quoted?.viewOnceMessage?.message ||
+          quoted?.viewOnceMessageV2?.message ||
           quoted?.documentWithCaptionMessage?.message ||
           quoted;
 
@@ -123,7 +124,7 @@ async function handleMessage(sock, msg) {
         } else if (quotedType === 'videoMessage') {
           mediaMsg = buildDownloadMsg(msg, quotedInner, ctxInfo, 'videoMessage');
           mediaType = 'video';
-          isGif = !!quotedInner.videoMessage.gifPlayback || (quotedInner.videoMessage.mimetype || '').includes('gif');
+          isGif = !!quotedInner.videoMessage?.gifPlayback || (quotedInner.videoMessage?.mimetype || '').includes('gif');
         } else if (quotedType === 'stickerMessage') {
           await reply(sock, msg, '⚠️ That\'s already a sticker! Send an image or video.');
           return;
@@ -171,17 +172,18 @@ async function handleMessage(sock, msg) {
 
     // ── Convert ───────────────────────────────────────────────────────────────
     let stickerBuffer;
-    let animated = false;
     try {
       if (mediaType === 'image') {
         stickerBuffer = await imageToSticker(buffer);
       } else {
-        const mime = isGif ? 'image/gif' : (mediaMsg.message?.videoMessage?.mimetype || 'video/mp4');
+        // WhatsApp "GIFs" are actually MP4 videos with gifPlayback=true.
+        // Pass 'image/gif' only for true GIF files; otherwise use the actual mimetype.
+        const actualMime = mediaMsg.message?.videoMessage?.mimetype || 'video/mp4';
+        const mime = isGif ? 'image/gif' : actualMime;
         stickerBuffer = await videoToSticker(buffer, mime);
-        animated = true;  // video/GIF always produces animated WebP
       }
     } catch (convertErr) {
-      console.error('Conversion failed:', convertErr.message);
+      console.error('Conversion failed:', convertErr.message, convertErr.stack);
       await react(sock, msg, '❌');
       await reply(sock, msg, '❌ Conversion failed. Make sure the media is a valid image/video/GIF.');
       return;
@@ -190,7 +192,7 @@ async function handleMessage(sock, msg) {
     // ── Send sticker ──────────────────────────────────────────────────────────
     await sock.sendMessage(
       from,
-      { sticker: stickerBuffer, ...(animated ? { isAnimated: true } : {}) },
+      { sticker: stickerBuffer },
       { quoted: msg }
     );
     await react(sock, msg, '✅');
